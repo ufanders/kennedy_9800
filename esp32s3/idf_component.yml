@@ -1,0 +1,13 @@
+## idf_component.yml — component dependencies for kennedy9800_usb
+dependencies:
+  idf: ">=5.2.0"
+
+  ## TinyUSB — USB MSC device stack (bundled with IDF 5.x via idf_component_manager)
+  espressif/tinyusb:
+    version: ">=0.15.0"
+
+  ## CMSIS-FreeRTOS — provides cmsis_os2.h wrappers over FreeRTOS
+  ## Matches the same CMSIS-RTOS v2 API used in the STM32 reference driver.
+  arm/cmsis-freertos:
+    version: ">=10.5.1"
+    path: components/cmsis_freertos
