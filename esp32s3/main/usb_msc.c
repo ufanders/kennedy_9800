@@ -143,7 +143,8 @@ bool tud_msc_start_stop_cb(uint8_t lun, uint8_t power_condition,
     (void)lun; (void)power_condition;
     if (load_eject) {
         if (!start) {
-            /* Host requested ejection — go offline */
+            /* Host requested ejection — flush pending writes, then go offline */
+            disk_io_flush();
             K9800_GoOffline();
             disk_io_set_ready(false);
             ESP_LOGI(TAG, "host ejected volume");
@@ -176,11 +177,20 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
     return (int32_t)bufsize;
 }
 
-/* Invoked for unhandled SCSI commands */
+/* Invoked for SCSI commands not natively handled by TinyUSB's MSC layer */
 int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16],
                           void *buffer, uint16_t bufsize)
 {
-    (void)lun; (void)buffer; (void)bufsize;
+    (void)buffer; (void)bufsize;
+
+    if (scsi_cmd[0] == 0x35) {   /* SYNCHRONIZE CACHE (10) */
+        if (disk_io_flush() != ESP_OK) {
+            tud_msc_set_sense(lun, SCSI_SENSE_ABORTED_COMMAND, 0x00, 0x00);
+            return -1;
+        }
+        return 0;
+    }
+
     tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST,
                        0x20, 0x00);  /* Invalid command */
     return -1;

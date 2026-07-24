@@ -247,6 +247,21 @@ uint32_t fat32_chain_length(uint32_t first_cluster)
     return count * FAT32_CLUSTER_SECS * DISK_SECTOR_SIZE;
 }
 
+/* Build the 8.3 short name for a dirent, same convention as
+ * disk_io.c's sync_dirent_to_ltfs(). 'out' must hold at least 13 bytes.
+ * Not reentrant (uses no shared state, but relies on the caller consuming
+ * the name immediately) — fine given the single-threaded USB task. */
+static void dirent_short_name(const uint8_t *e, char *out)
+{
+    int n = 0;
+    for (int i = 0; i < 8 && e[i] != 0x20; i++) out[n++] = (char)e[i];
+    if (e[8] != 0x20) {
+        out[n++] = '.';
+        for (int i = 8; i < 11 && e[i] != 0x20; i++) out[n++] = (char)e[i];
+    }
+    out[n] = '\0';
+}
+
 bool fat32_cluster_to_file(uint32_t cluster,
                             const char **out_filename,
                             uint32_t    *out_byte_offset)
@@ -257,6 +272,7 @@ bool fat32_cluster_to_file(uint32_t cluster,
     uint8_t *root = s_meta + ROOT_OFFSET;
     uint32_t max_dirents = (FAT32_CLUSTER_SECS * DISK_SECTOR_SIZE) / 32U;
     uint32_t cluster_bytes = FAT32_CLUSTER_SECS * DISK_SECTOR_SIZE;
+    static char name[13];
 
     for (uint32_t i = 0; i < max_dirents; i++) {
         uint8_t *e = root + i * 32U;
@@ -273,19 +289,11 @@ bool fat32_cluster_to_file(uint32_t cluster,
         uint32_t c = fc, offset = 0;
         while (c < 0x0FFFFFF8U && c != 0) {
             if (c == cluster) {
-                /* Found; reconstruct filename from LTFS index */
-                const ltfs_index_t *idx = ltfs_index();
-                if (idx) {
-                    /* Match by first_cluster approximation via FAT chain */
-                    for (uint32_t j = 0; j < LTFS_MAX_FILES; j++) {
-                        const ltfs_file_entry_t *f = &idx->files[j];
-                        if (!f->valid) continue;
-                        if (out_filename) *out_filename = f->name;
-                        if (out_byte_offset) *out_byte_offset = offset;
-                        return true;
-                    }
-                }
-                return false;
+                /* Found — this dirent owns 'cluster'; return its own name. */
+                dirent_short_name(e, name);
+                if (out_filename)    *out_filename    = name;
+                if (out_byte_offset) *out_byte_offset = offset;
+                return true;
             }
             c = fat32_read_fat_entry(c);
             offset += cluster_bytes;

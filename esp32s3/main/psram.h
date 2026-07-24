@@ -6,7 +6,7 @@
  * cache system.  We allocate three named regions at init time:
  *
  *   fat_meta  — FAT32 BPB, FSInfo, both FAT tables, root cluster
- *   ltfs_idx  — LTFS file index (256 entries)
+ *   ltfs_idx  — LTFS file index (128 entries, multi-extent)
  *   staging   — single tape-block staging buffer (4 KB)
  *
  * All three regions are allocated with MALLOC_CAP_SPIRAM so they land in

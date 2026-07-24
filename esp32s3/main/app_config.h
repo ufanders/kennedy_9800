@@ -11,8 +11,8 @@
 /* ── PSRAM layout (8 MB OPI PSRAM, addressed via heap_caps SPIRAM) ────────
  * Only metadata lives in PSRAM; file content is never cached.
  *   FAT32 metadata : BPB + FSInfo + 2× FAT tables + root cluster  ≈ 530 KB
- *   LTFS index     : 256 entries × ~260 B                         ≈  66 KB
- *   Tape I/O buf   : one tape block (4 KB) for staging
+ *   LTFS index     : 128 entries × ~316 B (multi-extent)          ≈  40 KB
+ *   Tape I/O buf   : one tape block (4 KB) for staging + data-block cache
  * ──────────────────────────────────────────────────────────────────────── */
 #define PSRAM_FAT_SIZE          (560UL  * 1024UL)
 #define PSRAM_LTFS_SIZE         (128UL  * 1024UL)
@@ -34,15 +34,20 @@
 #define FAT32_DATA_LBA          (FAT32_RESERVED_SECS + 2U * FAT32_FAT_SECS)
 
 /* ── LTFS limits ─────────────────────────────────────────────────────────── */
-#define LTFS_MAX_FILES          256U
+#define LTFS_MAX_FILES          128U     /* = dirents in one 4 KB root-dir cluster */
+#define LTFS_MAX_EXTENTS_PER_FILE 8U     /* extents per file, to allow append growth
+                                           * without relocating already-written data */
 #define LTFS_FILENAME_MAX       240U
 #define LTFS_BLOCK_BYTES        4096U
 #define LTFS_TAPE_MAX_BLOCKS    32768U      /* ~128 MB at 4 KB/block */
 
-/* On-tape block numbers */
+/* On-tape block numbers.
+ * The index no longer fits in a single 4 KB block once sized for
+ * LTFS_MAX_FILES × multi-extent entries, so LTFS_DATA_START_BLOCK is derived
+ * from sizeof(ltfs_index_t) — see LTFS_INDEX_BLOCKS / LTFS_DATA_START_BLOCK
+ * in ltfs.h, which is computed once the on-tape structs are declared. */
 #define LTFS_VOL_LABEL_BLOCK    0U
 #define LTFS_INDEX_BLOCK        1U
-#define LTFS_DATA_START_BLOCK   2U
 
 /* ── Kennedy 9800 timing (identical to reference; tape-speed-dependent) ─── */
 #define K9800_CHAR_PERIOD_US        100U    /* 10 kHz write rate */

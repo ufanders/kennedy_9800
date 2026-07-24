@@ -3,6 +3,7 @@ idf_component_register(
         "main.c"
         "kennedy9800.c"
         "psram.c"
+        "tape_io.c"
         "ltfs.c"
         "fat32_meta.c"
         "disk_io.c"
