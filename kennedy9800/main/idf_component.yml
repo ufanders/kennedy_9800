@@ -1,0 +1,9 @@
+## idf_component.yml — dependency manifest for the "main" component.
+## Must live inside the component's own directory (main/) — a manifest at
+## the project root is never read by the component manager.
+dependencies:
+  idf: ">=5.2.0"
+
+  ## TinyUSB — USB MSC device stack (bundled with IDF 5.x via idf_component_manager)
+  espressif/tinyusb:
+    version: ">=0.15.0"
