@@ -651,14 +651,16 @@ void K9800_DeInit(void)
     g.state = K9800_ST_UNINIT;
 }
 
+static portMUX_TYPE s_status_mux = portMUX_INITIALIZER_UNLOCKED;
+
 K9800_Error_t K9800_GetStatus(K9800_TransportStatus_t *s)
 {
     if (!s)                         return K9800_ERR_PARAM;
     if (g.state == K9800_ST_UNINIT) return K9800_ERR_NOT_INIT;
     k9800_update_status_cache();
-    taskENTER_CRITICAL();
+    taskENTER_CRITICAL(&s_status_mux);
     *s = g.status_cache;
-    taskEXIT_CRITICAL();
+    taskEXIT_CRITICAL(&s_status_mux);
     return K9800_OK;
 }
 

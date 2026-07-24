@@ -12,8 +12,12 @@ idf_component_register(
         "."
     REQUIRES
         driver
+        esp_driver_gpio
+        esp_driver_gptimer
+        esp_driver_i2c
         esp_timer
         esp_psram
+        esp_hw_support
         freertos
         tinyusb
         log
