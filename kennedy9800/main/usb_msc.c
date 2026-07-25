@@ -15,13 +15,14 @@
 #include "disk_io.h"
 #include "kennedy9800.h"
 #include "app_config.h"
-#include "tusb_config.h"
 
-#include "tinyusb.h"
+#include "tusb.h"
 #include "class/msc/msc_device.h"
+#include "esp_private/usb_phy.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <string.h>
 
 static const char *TAG = "usb_msc";
 
@@ -143,7 +144,8 @@ bool tud_msc_start_stop_cb(uint8_t lun, uint8_t power_condition,
     (void)lun; (void)power_condition;
     if (load_eject) {
         if (!start) {
-            /* Host requested ejection — go offline */
+            /* Host requested ejection — flush pending writes, then go offline */
+            disk_io_flush();
             K9800_GoOffline();
             disk_io_set_ready(false);
             ESP_LOGI(TAG, "host ejected volume");
@@ -176,11 +178,20 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
     return (int32_t)bufsize;
 }
 
-/* Invoked for unhandled SCSI commands */
+/* Invoked for SCSI commands not natively handled by TinyUSB's MSC layer */
 int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16],
                           void *buffer, uint16_t bufsize)
 {
-    (void)lun; (void)buffer; (void)bufsize;
+    (void)buffer; (void)bufsize;
+
+    if (scsi_cmd[0] == 0x35) {   /* SYNCHRONIZE CACHE (10) */
+        if (disk_io_flush() != ESP_OK) {
+            tud_msc_set_sense(lun, SCSI_SENSE_ABORTED_COMMAND, 0x00, 0x00);
+            return -1;
+        }
+        return 0;
+    }
+
     tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST,
                        0x20, 0x00);  /* Invalid command */
     return -1;
@@ -206,20 +217,37 @@ static void usb_device_task(void *arg)
     }
 }
 
+/* ── USB init ─────────────────────────────────────────────────────────────
+ * Raw TinyUSB core, not espressif/esp_tinyusb: that wrapper's MSC support
+ * (>=2.0) only backs a storage instance with SPI-flash wear-levelling or an
+ * SD/MMC card — no generic block-device callback API — so it can't host our
+ * tape+PSRAM virtual disk. We bring up the USB PHY ourselves the same way
+ * esp_tinyusb does internally, then drive tud_rhport_init()/tud_task() and
+ * the tud_msc_ and tud_descriptor_ callbacks above directly.
+ * ──────────────────────────────────────────────────────────────────────── */
+
 esp_err_t usb_msc_init(void)
 {
-    const tinyusb_config_t tusb_cfg = {
-        .device_descriptor        = &s_desc_device,
-        .string_descriptor        = s_strings,
-        .string_descriptor_count  = sizeof(s_strings) / sizeof(s_strings[0]),
-        .external_phy             = false,
-        .configuration_descriptor = s_desc_configuration,
+    const usb_phy_config_t phy_conf = {
+        .controller = USB_PHY_CTRL_OTG,
+        .target     = USB_PHY_TARGET_INT,
+        .otg_mode   = USB_OTG_MODE_DEVICE,
+        .otg_speed  = USB_PHY_SPEED_FULL,
     };
-
-    esp_err_t err = tinyusb_driver_install(&tusb_cfg);
+    usb_phy_handle_t phy_hdl;
+    esp_err_t err = usb_new_phy(&phy_conf, &phy_hdl);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "tinyusb install failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "USB PHY init failed: %s", esp_err_to_name(err));
         return err;
+    }
+
+    const tusb_rhport_init_t rh_init = {
+        .role  = TUSB_ROLE_DEVICE,
+        .speed = TUSB_SPEED_FULL,
+    };
+    if (!tud_rhport_init(0, &rh_init)) {
+        ESP_LOGE(TAG, "TinyUSB device stack init failed");
+        return ESP_FAIL;
     }
 
     xTaskCreate(usb_device_task, "usb_msc", 4096, NULL, PRI_USB, NULL);

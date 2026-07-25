@@ -3,8 +3,8 @@
  * @brief Public API for the Kennedy Model 9800 Digital Tape Transport.
  *
  * Thread-safe, blocking API.  All functions must be called from task context;
- * none may be called from ISR context.  Uses CMSIS-RTOS v2 for synchronisation
- * primitives so the implementation is portable across FreeRTOS targets.
+ * none may be called from ISR context.  Implemented directly on native
+ * FreeRTOS primitives (mutex, semaphores, event group, timer).
  *
  * Active-LOW convention: all Kennedy interface lines are 5 V TTL, active LOW.
  * A bidirectional 3.3 V ↔ 5 V level-shifter is required on every line.

@@ -15,17 +15,22 @@
  *   read path      — gpio_isr_handler on RDS GPIO47 fills ring buffer
  *   status         — MCP23017 polled over I2C; no EXTI on LDP/EOT lines
  *   delay          — esp_rom_delay_us() for µs, vTaskDelay() for ms
- *   RTOS           — CMSIS-RTOS v2 wrappers over FreeRTOS (same API as STM32)
+ *   RTOS           — native FreeRTOS primitives (mutex/semaphore/event
+ *                    group/timer), not a CMSIS-RTOS v2 wrapper: no such
+ *                    wrapper is published on the ESP Component Registry,
+ *                    so the STM32 reference's CMSIS-RTOS v2 API surface is
+ *                    not preserved here.
  */
 
 #include "kennedy9800.h"
 #include "kennedy9800_pins.h"
 #include "app_config.h"
 
-#include "cmsis_os2.h"
-#include "FreeRTOS.h"
-#include "task.h"
-#include "semphr.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "freertos/event_groups.h"
+#include "freertos/timers.h"
 
 #include "driver/gpio.h"
 #include "driver/gptimer.h"
@@ -77,11 +82,11 @@ static struct {
 
     ReadRing_t              read_ring;
 
-    osMutexId_t             api_mutex;
-    osSemaphoreId_t         write_done_sem;
-    osSemaphoreId_t         read_byte_sem;
-    osEventFlagsId_t        rgap_flags;
-    osTimerId_t             poll_timer;
+    SemaphoreHandle_t       api_mutex;        /* recursive */
+    SemaphoreHandle_t       write_done_sem;   /* binary */
+    SemaphoreHandle_t       read_byte_sem;    /* counting, K9800_READ_RING_SIZE */
+    EventGroupHandle_t      rgap_flags;
+    TimerHandle_t           poll_timer;
 
     gptimer_handle_t        write_timer;
     i2c_master_bus_handle_t i2c_bus;
@@ -192,9 +197,9 @@ static void k9800_update_status_cache(void)
     if (changed && g.status_cb) { g.status_cb(&g.status_cache); }
 }
 
-static void poll_timer_cb(void *arg)
+static void poll_timer_cb(TimerHandle_t timer)
 {
-    (void)arg;
+    (void)timer;
     k9800_update_status_cache();
 }
 
@@ -210,7 +215,7 @@ static bool IRAM_ATTR write_timer_isr(gptimer_handle_t timer,
     if (s_wtx.idx >= s_wtx.len) {
         /* All bytes sent; stop alarm and signal task */
         s_wtx.done = true;
-        xSemaphoreGiveFromISR((SemaphoreHandle_t)g.write_done_sem, &woken);
+        xSemaphoreGiveFromISR(g.write_done_sem, &woken);
         return woken == pdTRUE;
     }
 
@@ -256,7 +261,7 @@ static void IRAM_ATTR rds_isr_handler(void *arg)
     g.read_ring.head = next;
 
     BaseType_t woken = pdFALSE;
-    xSemaphoreGiveFromISR((SemaphoreHandle_t)g.read_byte_sem, &woken);
+    xSemaphoreGiveFromISR(g.read_byte_sem, &woken);
     portYIELD_FROM_ISR(woken);
 }
 
@@ -267,7 +272,7 @@ static void IRAM_ATTR rgap_isr_handler(void *arg)
     /* RGAP is active LOW: pin LOW → in gap, pin HIGH → data block */
     uint32_t in1 = GPIO.in1.val;
     uint32_t bit = (in1 & K9800_RGAP_IN1_BIT) ? RGAP_WENT_HIGH : RGAP_WENT_LOW;
-    xEventGroupSetBitsFromISR((EventGroupHandle_t)g.rgap_flags, bit, &woken);
+    xEventGroupSetBitsFromISR(g.rgap_flags, bit, &woken);
     portYIELD_FROM_ISR(woken);
 }
 
@@ -458,11 +463,10 @@ static K9800_Error_t write_block_internal(const uint8_t *data, uint32_t len)
 
     uint32_t timeout_ms = (len * K9800_CHAR_PERIOD_US / 1000U)
                         + K9800_WRITE_STOP_DELAY_MS + 200U;
-    osStatus_t stat = osSemaphoreAcquire(g.write_done_sem,
-                                         (uint32_t)timeout_ms);
+    BaseType_t stat = xSemaphoreTake(g.write_done_sem, pdMS_TO_TICKS(timeout_ms));
     write_stop_timer();
 
-    if (stat  != osOK)       { ret = K9800_ERR_TIMEOUT;  goto deassert; }
+    if (stat  != pdTRUE)     { ret = K9800_ERR_TIMEOUT;  goto deassert; }
     if (s_wtx.err)           { ret = K9800_ERR_DMA;       goto deassert; }
     if (g.abort_requested)   { ret = K9800_ERR_ABORTED;   goto deassert; }
 
@@ -502,8 +506,8 @@ static K9800_Error_t read_block_internal(uint8_t *buf, uint32_t buf_len,
     g.eot_flag = false;
     *out_len = 0;
 
-    while (osSemaphoreAcquire(g.read_byte_sem, 0) == osOK) {}
-    osEventFlagsClear(g.rgap_flags, RGAP_WENT_LOW | RGAP_WENT_HIGH);
+    while (xSemaphoreTake(g.read_byte_sem, 0) == pdTRUE) {}
+    xEventGroupClearBits(g.rgap_flags, RGAP_WENT_LOW | RGAP_WENT_HIGH);
 
     cmd_assert(K9800_SLT_GPIO);
     cmd_deassert(K9800_SWS_GPIO);
@@ -512,9 +516,10 @@ static K9800_Error_t read_block_internal(uint8_t *buf, uint32_t buf_len,
     g.state = K9800_ST_READING;
     cmd_assert(K9800_SFC_GPIO);
 
-    uint32_t flags = osEventFlagsWait(g.rgap_flags, RGAP_WENT_LOW,
-                                      osFlagsWaitAny, K9800_READY_TIMEOUT_MS);
-    if (flags & osFlagsError) {
+    EventBits_t flags = xEventGroupWaitBits(g.rgap_flags, RGAP_WENT_LOW,
+                                            pdTRUE, pdFALSE,
+                                            pdMS_TO_TICKS(K9800_READY_TIMEOUT_MS));
+    if (!(flags & RGAP_WENT_LOW)) {
         cmd_deassert(K9800_SFC_GPIO);
         cmd_deassert(K9800_SLT_GPIO);
         g.state = K9800_ST_IDLE;
@@ -525,8 +530,9 @@ static K9800_Error_t read_block_internal(uint8_t *buf, uint32_t buf_len,
     K9800_Error_t ret = K9800_OK;
     while (!block_done) {
         /* Non-blocking check for end-of-block */
-        uint32_t ev = osEventFlagsWait(g.rgap_flags, RGAP_WENT_HIGH,
-                                       osFlagsWaitAny | osFlagsNoClear, 1U);
+        EventBits_t ev = xEventGroupWaitBits(g.rgap_flags, RGAP_WENT_HIGH,
+                                             pdFALSE, pdFALSE,
+                                             pdMS_TO_TICKS(1));
 
         /* Drain ring buffer */
         uint32_t head = g.read_ring.head, tail = g.read_ring.tail;
@@ -596,19 +602,14 @@ K9800_Error_t K9800_Init(const K9800_Config_t *cfg)
     if ((ret = hw_i2c_init())          != K9800_OK) return ret;
     if ((ret = hw_write_timer_init())  != K9800_OK) return ret;
 
-    static const osMutexAttr_t      mx  = { "K9800Mtx",  osMutexRecursive|osMutexPrioInherit, NULL, 0 };
-    static const osSemaphoreAttr_t  ws  = { "K9800WDone", 0, NULL, 0 };
-    static const osSemaphoreAttr_t  rs  = { "K9800RByte", 0, NULL, 0 };
-    static const osEventFlagsAttr_t rg  = { "K9800Rgap",  0, NULL, 0 };
-    static const osTimerAttr_t      tmr = { "K9800Poll",  0, NULL, 0 };
+    if (!(g.api_mutex      = xSemaphoreCreateRecursiveMutex()))                 return K9800_ERR_NOT_INIT;
+    if (!(g.write_done_sem = xSemaphoreCreateBinary()))                        return K9800_ERR_NOT_INIT;
+    if (!(g.read_byte_sem  = xSemaphoreCreateCounting(K9800_READ_RING_SIZE, 0))) return K9800_ERR_NOT_INIT;
+    if (!(g.rgap_flags     = xEventGroupCreate()))                             return K9800_ERR_NOT_INIT;
+    if (!(g.poll_timer     = xTimerCreate("K9800Poll", pdMS_TO_TICKS(20), pdTRUE,
+                                          NULL, poll_timer_cb)))               return K9800_ERR_NOT_INIT;
 
-    if (!(g.api_mutex     = osMutexNew(&mx)))                               return K9800_ERR_NOT_INIT;
-    if (!(g.write_done_sem= osSemaphoreNew(1, 0, &ws)))                    return K9800_ERR_NOT_INIT;
-    if (!(g.read_byte_sem = osSemaphoreNew(K9800_READ_RING_SIZE, 0, &rs))) return K9800_ERR_NOT_INIT;
-    if (!(g.rgap_flags    = osEventFlagsNew(&rg)))                          return K9800_ERR_NOT_INIT;
-    if (!(g.poll_timer    = osTimerNew(poll_timer_cb, osTimerPeriodic, NULL, &tmr))) return K9800_ERR_NOT_INIT;
-
-    osTimerStart(g.poll_timer, 20U);
+    xTimerStart(g.poll_timer, 0);
     k9800_update_status_cache();
     g.state = K9800_ST_IDLE;
     return K9800_OK;
@@ -618,8 +619,8 @@ void K9800_DeInit(void)
 {
     if (g.state == K9800_ST_UNINIT) return;
     K9800_Abort();
-    osTimerStop(g.poll_timer);
-    osTimerDelete(g.poll_timer);
+    xTimerStop(g.poll_timer, portMAX_DELAY);
+    xTimerDelete(g.poll_timer, portMAX_DELAY);
 
     gptimer_stop(g.write_timer);
     gptimer_disable(g.write_timer);
@@ -641,23 +642,25 @@ void K9800_DeInit(void)
     }
 
     if (g.write_gpio_buf) { free(g.write_gpio_buf); g.write_gpio_buf = NULL; }
-    osMutexDelete(g.api_mutex);
-    osSemaphoreDelete(g.write_done_sem);
-    osSemaphoreDelete(g.read_byte_sem);
-    osEventFlagsDelete(g.rgap_flags);
+    vSemaphoreDelete(g.api_mutex);
+    vSemaphoreDelete(g.write_done_sem);
+    vSemaphoreDelete(g.read_byte_sem);
+    vEventGroupDelete(g.rgap_flags);
 
     memset(&g, 0, sizeof(g));
     g.state = K9800_ST_UNINIT;
 }
+
+static portMUX_TYPE s_status_mux = portMUX_INITIALIZER_UNLOCKED;
 
 K9800_Error_t K9800_GetStatus(K9800_TransportStatus_t *s)
 {
     if (!s)                         return K9800_ERR_PARAM;
     if (g.state == K9800_ST_UNINIT) return K9800_ERR_NOT_INIT;
     k9800_update_status_cache();
-    taskENTER_CRITICAL();
+    taskENTER_CRITICAL(&s_status_mux);
     *s = g.status_cache;
-    taskEXIT_CRITICAL();
+    taskEXIT_CRITICAL(&s_status_mux);
     return K9800_OK;
 }
 
@@ -684,10 +687,10 @@ K9800_Error_t K9800_WriteBlock(const uint8_t *data, uint32_t len)
 {
     if (g.state == K9800_ST_UNINIT)               return K9800_ERR_NOT_INIT;
     if (!data || !len || len > K9800_MAX_BLOCK_BYTES) return K9800_ERR_PARAM;
-    if (osMutexAcquire(g.api_mutex, K9800_READY_TIMEOUT_MS) != osOK) return K9800_ERR_BUSY;
+    if (xSemaphoreTakeRecursive(g.api_mutex, pdMS_TO_TICKS(K9800_READY_TIMEOUT_MS)) != pdTRUE) return K9800_ERR_BUSY;
     g.abort_requested = false;
     K9800_Error_t ret = write_block_internal(data, len);
-    osMutexRelease(g.api_mutex);
+    xSemaphoreGiveRecursive(g.api_mutex);
     return ret;
 }
 
@@ -695,10 +698,10 @@ K9800_Error_t K9800_ReadBlock(uint8_t *buf, uint32_t buf_len, uint32_t *out_len)
 {
     if (g.state == K9800_ST_UNINIT)    return K9800_ERR_NOT_INIT;
     if (!buf || !buf_len || !out_len)  return K9800_ERR_PARAM;
-    if (osMutexAcquire(g.api_mutex, K9800_READY_TIMEOUT_MS) != osOK) return K9800_ERR_BUSY;
+    if (xSemaphoreTakeRecursive(g.api_mutex, pdMS_TO_TICKS(K9800_READY_TIMEOUT_MS)) != pdTRUE) return K9800_ERR_BUSY;
     g.abort_requested = false;
     K9800_Error_t ret = read_block_internal(buf, buf_len, out_len);
-    osMutexRelease(g.api_mutex);
+    xSemaphoreGiveRecursive(g.api_mutex);
     return ret;
 }
 
@@ -706,10 +709,10 @@ K9800_Error_t K9800_Rewind(uint32_t timeout_ms)
 {
     if (g.state == K9800_ST_UNINIT) return K9800_ERR_NOT_INIT;
     if (!timeout_ms) timeout_ms = K9800_REWIND_TIMEOUT_MS;
-    if (osMutexAcquire(g.api_mutex, 1000U) != osOK) return K9800_ERR_BUSY;
+    if (xSemaphoreTakeRecursive(g.api_mutex, pdMS_TO_TICKS(1000U)) != pdTRUE) return K9800_ERR_BUSY;
 
     k9800_update_status_cache();
-    if (g.status_cache.at_load_point) { osMutexRelease(g.api_mutex); return K9800_OK; }
+    if (g.status_cache.at_load_point) { xSemaphoreGiveRecursive(g.api_mutex); return K9800_OK; }
 
     g.state = K9800_ST_REWINDING;
     cmd_pulse(K9800_RWC_GPIO, K9800_RWC_PULSE_US);
@@ -724,14 +727,14 @@ K9800_Error_t K9800_Rewind(uint32_t timeout_ms)
         vTaskDelay(pdMS_TO_TICKS(100));
     }
     g.state = K9800_ST_IDLE;
-    osMutexRelease(g.api_mutex);
+    xSemaphoreGiveRecursive(g.api_mutex);
     return ret;
 }
 
 K9800_Error_t K9800_SpaceForward(uint32_t duration_ms)
 {
     if (g.state == K9800_ST_UNINIT) return K9800_ERR_NOT_INIT;
-    if (osMutexAcquire(g.api_mutex, 1000U) != osOK) return K9800_ERR_BUSY;
+    if (xSemaphoreTakeRecursive(g.api_mutex, pdMS_TO_TICKS(1000U)) != pdTRUE) return K9800_ERR_BUSY;
     g.state = K9800_ST_SPACING;
     g.eot_flag = false;
     cmd_assert(K9800_SLT_GPIO);
@@ -748,14 +751,14 @@ K9800_Error_t K9800_SpaceForward(uint32_t duration_ms)
     vTaskDelay(pdMS_TO_TICKS(K9800_RAMP_TIME_MS));
     cmd_deassert(K9800_SLT_GPIO);
     g.state = K9800_ST_IDLE;
-    osMutexRelease(g.api_mutex);
+    xSemaphoreGiveRecursive(g.api_mutex);
     return ret;
 }
 
 K9800_Error_t K9800_SpaceReverse(uint32_t duration_ms)
 {
     if (g.state == K9800_ST_UNINIT) return K9800_ERR_NOT_INIT;
-    if (osMutexAcquire(g.api_mutex, 1000U) != osOK) return K9800_ERR_BUSY;
+    if (xSemaphoreTakeRecursive(g.api_mutex, pdMS_TO_TICKS(1000U)) != pdTRUE) return K9800_ERR_BUSY;
     g.state = K9800_ST_SPACING;
     cmd_assert(K9800_SLT_GPIO);
     cmd_assert(K9800_SRC_GPIO);
@@ -772,7 +775,7 @@ K9800_Error_t K9800_SpaceReverse(uint32_t duration_ms)
     vTaskDelay(pdMS_TO_TICKS(K9800_RAMP_TIME_MS));
     cmd_deassert(K9800_SLT_GPIO);
     g.state = K9800_ST_IDLE;
-    osMutexRelease(g.api_mutex);
+    xSemaphoreGiveRecursive(g.api_mutex);
     return ret;
 }
 

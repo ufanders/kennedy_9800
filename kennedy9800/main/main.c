@@ -42,6 +42,12 @@ static void tape_sync_task(void *arg)
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(5000));   /* check every 5 s */
 
+        if (disk_io_ready()) {
+            /* Bound how long writes can sit only in the PSRAM block cache
+             * before being committed to tape. */
+            disk_io_flush();
+        }
+
         K9800_TransportStatus_t st;
         if (K9800_GetStatus(&st) != K9800_OK) continue;
 

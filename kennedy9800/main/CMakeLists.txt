@@ -3,6 +3,7 @@ idf_component_register(
         "main.c"
         "kennedy9800.c"
         "psram.c"
+        "tape_io.c"
         "ltfs.c"
         "fat32_meta.c"
         "disk_io.c"
@@ -11,11 +12,14 @@ idf_component_register(
         "."
     REQUIRES
         driver
+        esp_driver_gpio
+        esp_driver_gptimer
+        esp_driver_i2c
         esp_timer
         esp_psram
+        esp_hw_support
         freertos
         tinyusb
-        cmsis_freertos
         log
         heap
 )

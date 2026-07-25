@@ -1,0 +1,15 @@
+## idf_component.yml — dependency manifest for the "main" component.
+## Must live inside the component's own directory (main/) — a manifest at
+## the project root is never read by the component manager.
+dependencies:
+  idf: ">=5.2.0"
+
+  ## Raw TinyUSB core (hathach/tinyusb via Espressif's fork). We deliberately
+  ## do NOT use espressif/esp_tinyusb here: its MSC support (>=2.0) only
+  ## backs a storage instance with SPI-flash wear-levelling or an SD/MMC
+  ## card, with no generic block-device callback API any more — it can't
+  ## host our tape+PSRAM virtual disk. We drive the raw tud_msc_*/
+  ## tud_descriptor_* callback contract directly instead (see usb_msc.c),
+  ## bringing up the USB PHY ourselves via esp_hw_support's usb_phy API.
+  espressif/tinyusb:
+    version: ">=0.15.0"
