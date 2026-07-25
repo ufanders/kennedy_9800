@@ -7,5 +7,12 @@
     "--query-driver=**",
     "--compile-commands-dir=/Users/andersnelson/Documents/github/kennedy_9800/kennedy9800/build"
   ],
-  "idf.currentSetup": "/Users/andersnelson/.espressif/v6.0.2/esp-idf"
+  "idf.currentSetup": "/Users/andersnelson/.espressif/v6.0.2/esp-idf",
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32s3"
+  },
+  "idf.flashType": "JTAG",
+  "idf.openOcdConfigs": [
+    "board/esp32s3-builtin.cfg"
+  ]
 }
